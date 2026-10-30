@@ -1,0 +1,37 @@
+[project]
+name = "codepilot-ai"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "deepagents>=0.7.18,<0.8",
+    "docker>=7.2.0",
+    "fastapi>=0.162.0",
+    "httpx>=0.28.1",
+    "langchain>=1.0,<2.0",
+    "langchain-anthropic>=1.7.7",
+    "langchain-core>=1.0,<2.0",
+    "langchain-google-genai>=4.4.2",
+    "langchain-openai>=1.7.3",
+    "langgraph>=1.0,<2.0",
+    "pydantic>=2.14.2",
+    "pydantic-settings>=2.16.2",
+    "python-dotenv>=1.2.4",
+    "streamlit>=1.66.1",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+codepilot-ai = "codepilot_ai:main"
+
+[build-system]
+requires = ["uv_build>=0.13.3,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.3",
+]
