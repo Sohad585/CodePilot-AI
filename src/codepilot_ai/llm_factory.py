@@ -2,39 +2,39 @@
 import os
 
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 
-
-# Load environment variables from .env
 load_dotenv()
 
 
-def get_llm(provider: str = "google"):
+def get_llm(provider: str = "groq"):
     """
     Create and return an LLM instance.
 
     Currently supported provider:
-    - google (Gemini)
+    - groq
     """
 
-    if provider.lower() == "google":
+    if provider.lower() == "groq":
 
-        api_key = os.getenv("GOOGLE_API_KEY")
+        api_key = os.getenv("GROQ_API_KEY")
         model_name = os.getenv(
-            "GEMINI_MODEL",
-            "gemini-3.8-flash"
+            "GROQ_MODEL",
+            "openai/gpt-oss-120b"
         )
 
         if not api_key:
             raise ValueError(
-                "GOOGLE_API_KEY is missing. "
+                "GROQ_API_KEY is missing. "
                 "Please check your .env file."
             )
 
-        return ChatGoogleGenerativeAI(
+        return ChatGroq(
             model=model_name,
-            google_api_key=api_key,
-            temperature=0
+            api_key=api_key,
+            temperature=0,
+            timeout=160,
+            max_retries=1
         )
 
     raise ValueError(
