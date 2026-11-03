@@ -1,10 +1,12 @@
-
 import os
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+
+from codepilot_ai.llm_utils import LLMConfigurationError
 
 load_dotenv()
+
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 
 
 def get_llm(provider: str = "groq"):
@@ -13,21 +15,26 @@ def get_llm(provider: str = "groq"):
 
     Currently supported provider:
     - groq
+
+    Environment variables:
+    - GROQ_API_KEY (required)
+    - GROQ_MODEL   (optional, defaults to DEFAULT_GROQ_MODEL)
     """
 
     if provider.lower() == "groq":
 
-        api_key = os.getenv("GROQ_API_KEY")
-        model_name = os.getenv(
-            "GROQ_MODEL",
-            "openai/gpt-oss-120b"
-        )
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        model_name = os.getenv("GROQ_MODEL", "").strip() or DEFAULT_GROQ_MODEL
 
         if not api_key:
-            raise ValueError(
-                "GROQ_API_KEY is missing. "
-                "Please check your .env file."
+            raise LLMConfigurationError(
+                "GROQ_API_KEY is not set. Add it to the backend's .env file "
+                "(see .env.example) and restart the backend."
             )
+
+        # Imported here so the rest of the package can be imported (and
+        # tested) without the provider SDK being installed.
+        from langchain_groq import ChatGroq
 
         return ChatGroq(
             model=model_name,
@@ -37,6 +44,6 @@ def get_llm(provider: str = "groq"):
             max_retries=1
         )
 
-    raise ValueError(
+    raise LLMConfigurationError(
         f"Unsupported LLM provider: {provider}"
     )

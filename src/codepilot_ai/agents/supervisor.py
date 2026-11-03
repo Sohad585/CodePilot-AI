@@ -1,11 +1,57 @@
 
-import json
-
 from codepilot_ai.llm_factory import get_llm
-from codepilot_ai.agents.analyzer import analyze_python_code
-from codepilot_ai.agents.debugger import debug_python_code
-from codepilot_ai.agents.refactorer import refactor_python_code
-from codepilot_ai.agents.tester import evaluate_test_results
+from codepilot_ai.llm_utils import (
+    LLMResponseError,
+    code_fence,
+    error_result,
+    extract_text,
+    parse_json_object,
+    require_fields,
+)
+
+# Agents always run in this order, whatever order the model lists them in:
+# find problems, fix them, only then refactor the fixed code, and evaluate
+# the supplied test report last. Each agent runs at most once per task.
+AGENT_ORDER = ("Analyzer", "Debugger", "Refactorer", "Tester")
+
+VALID_TASK_TYPES = {
+    "analysis",
+    "debugging",
+    "refactoring",
+    "testing",
+    "multiple",
+    "unclear"
+}
+
+
+def normalize_agents(selected_agents: list) -> list[str]:
+    """
+    Validate agent names, remove duplicates and put them in execution order.
+
+    Names are matched case-insensitively. Unknown names raise
+    ``LLMResponseError``.
+    """
+
+    by_lower_name = {name.lower(): name for name in AGENT_ORDER}
+    chosen = set()
+
+    for agent in selected_agents:
+
+        canonical = (
+            by_lower_name.get(agent.strip().lower())
+            if isinstance(agent, str)
+            else None
+        )
+
+        if canonical is None:
+            raise LLMResponseError(
+                f"The Supervisor selected an unknown agent: {agent!r}."
+            )
+
+        chosen.add(canonical)
+
+    return [name for name in AGENT_ORDER if name in chosen]
+
 
 def supervise_task(task: str, source_code: str = "") -> dict:
     """
@@ -17,21 +63,24 @@ def supervise_task(task: str, source_code: str = "") -> dict:
     if not isinstance(task, str) or not task.strip():
         return {
             "success": False,
-            "error": "Task must be a non-empty string."
+            "error": "Task must be a non-empty string.",
+            "error_type": "invalid_input",
+            "retryable": False
         }
 
     if not isinstance(source_code, str):
         return {
             "success": False,
-            "error": "Source code must be a string."
+            "error": "Source code must be a string.",
+            "error_type": "invalid_input",
+            "retryable": False
         }
 
-    try:
-        llm = get_llm()
+    fence_open, fence_close = code_fence(source_code)
 
-        prompt = f"""
+    prompt = f"""
 You are the Supervisor of CodePilot AI,
-an autonomous Python debugging and refactoring system.
+a Python code analysis, debugging and refactoring assistant.
 
 Your responsibility is to understand the user's task,
 select the appropriate specialized agent, and create an execution plan.
@@ -57,9 +106,9 @@ User task:
 {task}
 
 Python source code:
-```python
+{fence_open}
 {source_code}
-```
+{fence_close}
 
 Instructions:
 1. Understand the user's primary objective.
@@ -94,234 +143,34 @@ The selected_agents must contain only agent names from the
 available agents list.
 """
 
-        response = llm.invoke(prompt)
-        content = response.content
+    try:
+        llm = get_llm()
+        result = parse_json_object(extract_text(llm.invoke(prompt)))
 
-        if isinstance(content, list):
-            content = "\n".join(
-                block["text"]
-                for block in content
-                if isinstance(block, dict)
-                and block.get("type") == "text"
+        require_fields(
+            result,
+            {
+                "selected_agents": list,
+                "task_type": str,
+                "execution_plan": list,
+                "reason": str,
+                "needs_clarification": bool,
+                "clarification_question": str
+            }
+        )
+
+        if result["task_type"] not in VALID_TASK_TYPES:
+            raise LLMResponseError(
+                "The Supervisor returned an invalid task_type."
             )
 
-        content = content.strip()
-
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1]
-            content = content.rsplit("```", 1)[0].strip()
-
-        result = json.loads(content)
-
-        required_fields = {
-            "selected_agents",
-            "task_type",
-            "execution_plan",
-            "reason",
-            "needs_clarification",
-            "clarification_question"
-        }
-
-        if not isinstance(result, dict) or not required_fields.issubset(result):
-            return {
-                "success": False,
-                "error": "The AI returned an invalid supervision response."
-            }
-
-        valid_agents = {
-            "Analyzer",
-            "Debugger",
-            "Refactorer",
-            "Tester"
-        }
-
-        if (
-            not isinstance(result["selected_agents"], list)
-            or not all(
-                agent in valid_agents
-                for agent in result["selected_agents"]
-            )
-            or not isinstance(result["execution_plan"], list)
-            or not isinstance(result["reason"], str)
-            or not isinstance(result["needs_clarification"], bool)
-            or not isinstance(result["clarification_question"], str)
-            or result["task_type"] not in {
-                "analysis",
-                "debugging",
-                "refactoring",
-                "testing",
-                "multiple",
-                "unclear"
-            }
-        ):
-            return {
-                "success": False,
-                "error": "The AI returned invalid supervision fields."
-            }
+        result["selected_agents"] = normalize_agents(result["selected_agents"])
+        result["execution_plan"] = [str(step) for step in result["execution_plan"]]
 
         return {
             "success": True,
             "supervision": result
         }
 
-    except json.JSONDecodeError:
-        return {
-            "success": False,
-            "error": "Could not parse the AI supervision response as JSON."
-        }
-
     except Exception as error:
-        return {
-            "success": False,
-            "error": f"Supervision failed: {error}"
-        }
-
-
-def run_supervised_task(
-    task: str,
-    source_code: str = "",
-    error_context: str = "",
-    test_report: dict = None
-) -> dict:
-    """
-    Execute the agents selected by the Supervisor.
-
-    The Supervisor routes the task, and specialized agents
-    perform their assigned operations.
-    """
-
-    # Step 1: Ask the Supervisor to select the agents
-    supervision_result = supervise_task(task, source_code)
-
-    if not supervision_result["success"]:
-        return supervision_result
-
-    supervision = supervision_result["supervision"]
-
-    if supervision["needs_clarification"]:
-        return {
-            "success": False,
-            "message": "The task requires clarification.",
-            "clarification_question": supervision["clarification_question"],
-            "supervision": supervision
-        }
-
-    selected_agents = supervision["selected_agents"]
-
-    if not selected_agents:
-        return {
-            "success": False,
-            "error": "The Supervisor did not select any agent."
-        }
-
-    if "Tester" in selected_agents and test_report is None:
-        return {
-            "success": False,
-            "error": "A pytest report is required for the Tester Agent.",
-            "supervision": supervision
-        }
-
-    current_code = source_code
-    agent_results = {}
-
-    # Step 2: Execute the selected agents in order
-    for agent_name in selected_agents:
-
-        if agent_name == "Analyzer":
-
-            if not current_code.strip():
-                return {
-                    "success": False,
-                    "error": "Source code is required by the Analyzer Agent.",
-                    "agent_results": agent_results
-                }
-
-            result = analyze_python_code(current_code)
-
-        elif agent_name == "Debugger":
-
-            if not current_code.strip():
-                return {
-                    "success": False,
-                    "error": "Source code is required by the Debugger Agent.",
-                    "agent_results": agent_results
-                }
-
-            result = debug_python_code(
-                current_code,
-                error_context
-            )
-
-            if result["success"]:
-                current_code = result["fixed_code"]
-
-        elif agent_name == "Refactorer":
-
-            if not current_code.strip():
-                return {
-                    "success": False,
-                    "error": "Source code is required by the Refactorer Agent.",
-                    "agent_results": agent_results
-                }
-
-            result = refactor_python_code(current_code)
-
-            if result["success"]:
-                current_code = result["refactored_code"]
-
-        elif agent_name == "Tester":
-
-            result = evaluate_test_results(test_report)
-
-        else:
-            return {
-                "success": False,
-                "error": f"Unsupported agent: {agent_name}"
-            }
-
-        agent_results[agent_name] = result
-
-        if agent_name == "Analyzer":
-
-            if (
-                "valid_syntax" not in result
-                or "static_analysis" not in result
-            ):
-                return {
-                    "success": False,
-                    "error": "Analyzer returned an invalid result.",
-                    "agent_results": agent_results,
-                    "supervision": supervision
-                }
-
-            ai_result = result.get("ai_analysis", {})
-
-            if (
-                isinstance(ai_result, dict)
-                and not ai_result.get("success", False)
-                and "error" in ai_result
-            ):
-                return {
-                    "success": False,
-                    "error": "Analyzer completed static analysis, but AI analysis failed.",
-                    "agent_results": agent_results,
-                    "supervision": supervision
-                }
-
-        elif not result.get("success", False):
-
-            return {
-                "success": False,
-                "error": f"{agent_name} Agent failed.",
-                "agent_results": agent_results,
-                "supervision": supervision
-            }
-
-    # Step 3: Return the combined results
-    return {
-        "success": True,
-        "task": task,
-        "supervision": supervision,
-        "agent_results": agent_results,
-        "final_code": current_code if source_code else None
-    }
+        return error_result(error, context="Supervision")

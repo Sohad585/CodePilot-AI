@@ -2,6 +2,19 @@
 import json
 from pathlib import Path
 
+# Long tracebacks are cut so reports stay small enough for the Tester prompt.
+MAX_TEXT_CHARS = 4_000
+
+
+def _limit_text(value) -> str:
+    """Return ``value`` as text, cut to MAX_TEXT_CHARS characters."""
+    text = value if isinstance(value, str) else str(value or "")
+
+    if len(text) > MAX_TEXT_CHARS:
+        return text[:MAX_TEXT_CHARS] + "\n... [truncated]"
+
+    return text
+
 
 def parse_pytest_report(report_path: str) -> dict:
     """
@@ -82,15 +95,40 @@ def parse_pytest_report(report_path: str) -> dict:
                 "error": "Invalid Pytest report summary values."
             }
 
-        # 4. Extract collection errors
-        errors = sum(
-            1
-            for collector in collectors
-            if isinstance(collector, dict)
-            and collector.get("outcome") == "failed"
-        )
+        # 4. Extract collection errors (import errors, syntax errors, ...)
+        collection_errors = []
 
-        # 5. Extract failed test details
+        for collector in collectors:
+
+            if (
+                not isinstance(collector, dict)
+                or collector.get("outcome") != "failed"
+            ):
+                continue
+
+            collection_errors.append({
+                "nodeid": str(collector.get("nodeid", "")),
+                "message": _limit_text(collector.get("longrepr", ""))
+            })
+
+        # Test errors (for example in fixtures) are reported by pytest as
+        # outcome "error" and counted under summary["error"].
+        test_errors = summary_data.get("error", summary_data.get("errors", 0))
+
+        if (
+            not isinstance(test_errors, int)
+            or isinstance(test_errors, bool)
+            or test_errors < 0
+        ):
+            return {
+                "success": False,
+                "report_parsed": False,
+                "error": "Invalid Pytest report summary values."
+            }
+
+        errors = max(len(collection_errors), test_errors)
+
+        # 5. Extract failed and errored test details
         failures = []
 
         for test in tests:
@@ -98,7 +136,7 @@ def parse_pytest_report(report_path: str) -> dict:
             if not isinstance(test, dict):
                 continue
 
-            if test.get("outcome") != "failed":
+            if test.get("outcome") not in ("failed", "error"):
                 continue
 
             nodeid = test.get("nodeid", "")
@@ -140,6 +178,7 @@ def parse_pytest_report(report_path: str) -> dict:
 
             failures.append({
                 "test_name": test_name,
+                "outcome": test.get("outcome"),
                 "file": crash.get("path", test_file),
                 "line": crash.get("lineno", test.get("lineno")),
                 "stage": failure_stage_name,
@@ -148,9 +187,9 @@ def parse_pytest_report(report_path: str) -> dict:
                     if traceback and isinstance(traceback[-1], dict)
                     else "Test failed"
                 ),
-                "message": crash.get("message", ""),
-                "traceback": traceback_text,
-                "details": failure_stage.get("longrepr", "")
+                "message": _limit_text(crash.get("message", "")),
+                "traceback": _limit_text(traceback_text),
+                "details": _limit_text(failure_stage.get("longrepr", ""))
             })
 
         # 6. Determine actual test status
@@ -175,7 +214,8 @@ def parse_pytest_report(report_path: str) -> dict:
                 "skipped": skipped,
                 "duration": round(duration, 3)
             },
-            "failures": failures
+            "failures": failures,
+            "collection_errors": collection_errors
         }
 
     except json.JSONDecodeError:

@@ -1,14 +1,18 @@
 
+import os
+import re
 import subprocess
+import sys
 import tempfile
 import shutil
 import threading
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
-# Docker sandbox configuration
-SANDBOX_IMAGE = "autodebug-sandbox:2"
+# Docker sandbox configuration.
+# Build the image with:  docker build -t autodebug-sandbox:2 .
+SANDBOX_IMAGE = os.getenv("CODEPILOT_SANDBOX_IMAGE", "autodebug-sandbox:2")
 
 MEMORY_LIMIT = "256m"
 CPU_LIMIT = "0.5"
@@ -18,6 +22,39 @@ EXECUTION_TIMEOUT = 30
 OUTPUT_LIMIT = 100_000
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+# Code submitted through the API is staged here (never mounted into Docker).
+STAGING_ROOT = Path(tempfile.gettempdir()) / "codepilot_staging"
+
+TRUNCATION_MARKER = b"\n[... output truncated by CodePilot ...]\n"
+
+
+def _is_unsafe_relative_path(file_path: str) -> bool:
+    """
+    Return True if the path is not a plain, safe relative path.
+
+    Checked with both POSIX and Windows rules so the result does not depend
+    on the host OS. Rejects absolute, rooted, drive-qualified and UNC paths,
+    and parent traversal (..) with either slash style.
+    """
+
+    posix = PurePosixPath(file_path)
+    windows = PureWindowsPath(file_path)
+
+    if posix.is_absolute() or windows.is_absolute():
+        return True
+
+    # Rooted ("\\dir\\f.py"), drive-relative ("C:f.py") and UNC paths.
+    if windows.root or windows.drive:
+        return True
+
+    return ".." in posix.parts or ".." in windows.parts
+
+
+def _normalize_relative_path(file_path: str) -> str:
+    """Normalize a validated relative path to POSIX form for comparison."""
+
+    return PureWindowsPath(file_path).as_posix()
 
 
 def _read_limited_output(stream, limit: int = OUTPUT_LIMIT) -> dict:
@@ -66,7 +103,7 @@ def _read_limited_output(stream, limit: int = OUTPUT_LIMIT) -> dict:
         output = bytes(first_part) + bytes(last_part[overlap:])
 
     else:
-        output = bytes(first_part) + bytes(last_part)
+        output = bytes(first_part) + TRUNCATION_MARKER + bytes(last_part)
 
     return {
         "output": output.decode("utf-8", errors="replace"),
@@ -82,16 +119,21 @@ def validate_workspace(workspace_path: str) -> dict:
     The workspace must:
     - Exist.
     - Be a directory.
-    - Be inside the project directory.
+    - Be inside the project directory or the sandbox staging directory.
     """
 
     try:
         workspace = Path(workspace_path).resolve()
 
-        if not workspace.is_relative_to(PROJECT_ROOT):
+        allowed_roots = (PROJECT_ROOT.resolve(), STAGING_ROOT.resolve())
+
+        if not any(workspace.is_relative_to(root) for root in allowed_roots):
             return {
                 "success": False,
-                "error": "Workspace must be inside the project directory."
+                "error": (
+                    "Workspace must be inside the project directory "
+                    "or the sandbox staging directory."
+                )
             }
 
         if not workspace.exists():
@@ -222,10 +264,14 @@ def create_temp_workspace(
 
         for relative_file in relative_files:
 
-            relative_path = Path(relative_file)
-
-            if relative_path.is_absolute() or ".." in relative_path.parts:
+            if (
+                not isinstance(relative_file, str)
+                or not relative_file.strip()
+                or _is_unsafe_relative_path(relative_file)
+            ):
                 raise ValueError("Invalid file path.")
+
+            relative_path = Path(relative_file)
 
             if any(part in blocked_names for part in relative_path.parts):
                 raise ValueError("Access to restricted files is denied.")
@@ -287,36 +333,6 @@ def create_temp_workspace(
 
 
 
-def test_temp_workspace_creation() -> dict:
-    """
-    Test temporary workspace creation using the existing test file.
-    """
-
-    result = create_temp_workspace(
-        workspace_path=str(PROJECT_ROOT),
-        relative_files=["test_pytest_runner.py"]
-    )
-
-    if not result["success"]:
-        return result
-
-    temp_workspace = result["workspace"]
-
-    try:
-        copied_file = temp_workspace / "test_pytest_runner.py"
-
-        return {
-            "success": copied_file.is_file(),
-            "files_copied": result["files_copied"],
-            "copied_file_exists": copied_file.is_file()
-        }
-
-    finally:
-        shutil.rmtree(temp_workspace, ignore_errors=True)
-
-
-
-
 def run_tests_in_sandbox(
     workspace_path: str,
     relative_files: list[str],
@@ -344,6 +360,7 @@ def run_tests_in_sandbox(
     ):
         return {
             "success": False,
+            "error_type": "invalid_input",
             "error": "relative_files must be a list of non-empty file paths."
         }
 
@@ -357,6 +374,7 @@ def run_tests_in_sandbox(
     ):
         return {
             "success": False,
+            "error_type": "invalid_input",
             "error": "test_files must be a non-empty list of valid file paths."
         }
 
@@ -367,6 +385,7 @@ def run_tests_in_sandbox(
     ):
         return {
             "success": False,
+            "error_type": "invalid_input",
             "error": "Timeout must be a positive integer."
         }
 
@@ -374,28 +393,27 @@ def run_tests_in_sandbox(
     normalized_files = set()
 
     for file_path in relative_files:
-        path = Path(file_path)
-
-        if path.is_absolute() or ".." in path.parts:
+        if _is_unsafe_relative_path(file_path):
             return {
                 "success": False,
+                "error_type": "invalid_input",
                 "error": "Invalid file path."
             }
 
-        normalized_files.add(path.as_posix())
+        normalized_files.add(_normalize_relative_path(file_path))
 
     for test_file in test_files:
-        path = Path(test_file)
-
-        if path.is_absolute() or ".." in path.parts:
+        if _is_unsafe_relative_path(test_file):
             return {
                 "success": False,
+                "error_type": "invalid_input",
                 "error": "Invalid test file path."
             }
 
-        if path.as_posix() not in normalized_files:
+        if _normalize_relative_path(test_file) not in normalized_files:
             return {
                 "success": False,
+                "error_type": "invalid_input",
                 "error": (
                     "Test file was not included in copied files: "
                     f"{test_file}"
@@ -406,7 +424,13 @@ def run_tests_in_sandbox(
     environment = check_docker_environment()
 
     if not environment["success"]:
-        return environment
+        return {
+            **environment,
+            "error_type": "sandbox_unavailable",
+            "execution_success": False,
+            "report_parsed": False,
+            "tests_passed": None
+        }
 
     # 4. Prepare the host staging workspace
     workspace_result = create_temp_workspace(
@@ -415,7 +439,13 @@ def run_tests_in_sandbox(
     )
 
     if not workspace_result["success"]:
-        return workspace_result
+        return {
+            **workspace_result,
+            "error_type": "invalid_input",
+            "execution_success": False,
+            "report_parsed": False,
+            "tests_passed": None
+        }
 
     temp_workspace = workspace_result["workspace"]
 
@@ -457,6 +487,7 @@ def run_tests_in_sandbox(
                 "--network", "none",
                 "--read-only",
                 "--memory", MEMORY_LIMIT,
+                "--memory-swap", MEMORY_LIMIT,
                 "--cpus", CPU_LIMIT,
                 "--pids-limit", str(PID_LIMIT),
                 "--user", "10001:10001",
@@ -475,12 +506,13 @@ def run_tests_in_sandbox(
             ],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=30
         )
 
         if create_result.returncode != 0:
             return {
                 "success": False,
+                "error_type": "sandbox_error",
                 "execution_success": False,
                 "report_parsed": False,
                 "tests_passed": None,
@@ -495,6 +527,7 @@ def run_tests_in_sandbox(
         if not container_id:
             return {
                 "success": False,
+                "error_type": "sandbox_error",
                 "execution_success": False,
                 "report_parsed": False,
                 "tests_passed": None,
@@ -514,6 +547,7 @@ def run_tests_in_sandbox(
         if start_result.returncode != 0:
             return {
                 "success": False,
+                "error_type": "sandbox_error",
                 "execution_success": False,
                 "report_parsed": False,
                 "tests_passed": None,
@@ -564,6 +598,7 @@ def run_tests_in_sandbox(
 
                 return {
                     "success": False,
+                    "error_type": "sandbox_error",
                     "execution_success": False,
                     "report_parsed": False,
                     "tests_passed": None,
@@ -638,6 +673,7 @@ def run_tests_in_sandbox(
 
             result = {
                 "success": False,
+                "error_type": "sandbox_timeout",
                 "execution_success": False,
                 "report_parsed": False,
                 "tests_passed": None,
@@ -679,6 +715,7 @@ def run_tests_in_sandbox(
         if report_result.returncode != 0:
             result = {
                 "success": False,
+                "error_type": "sandbox_error",
                 "execution_success": True,
                 "report_parsed": False,
                 "tests_passed": None,
@@ -706,6 +743,7 @@ def run_tests_in_sandbox(
         if not parsed_report.get("success", False):
             result = {
                 "success": False,
+                "error_type": "sandbox_error",
                 "execution_success": True,
                 "report_parsed": False,
                 "tests_passed": None,
@@ -736,6 +774,7 @@ def run_tests_in_sandbox(
     except subprocess.TimeoutExpired:
         return {
             "success": False,
+            "error_type": "sandbox_timeout",
             "execution_success": False,
             "report_parsed": False,
             "tests_passed": None,
@@ -747,6 +786,7 @@ def run_tests_in_sandbox(
     except (OSError, ValueError, RuntimeError) as error:
         return {
             "success": False,
+            "error_type": "sandbox_error",
             "execution_success": False,
             "report_parsed": False,
             "tests_passed": None,
@@ -793,3 +833,128 @@ def run_tests_in_sandbox(
 
                 # 17. Remove host staging workspace
                 shutil.rmtree(temp_workspace, ignore_errors=True)
+
+
+# Module names that must not be shadowed inside the sandbox: a staged file
+# called ``json.py`` or ``queue.py`` would break pytest itself.
+_RESERVED_MODULE_NAMES = set(sys.stdlib_module_names) | {
+    "pytest",
+    "_pytest",
+    "pluggy",
+    "conftest",
+    "pytest_jsonreport",
+}
+
+_SOURCE_FILENAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\.py$")
+
+USER_TEST_FILENAME = "test_codepilot_user_tests.py"
+
+
+def validate_source_filename(source_filename: str) -> dict:
+    """
+    Check that ``source_filename`` is a safe module file name for the sandbox.
+
+    It must be a plain ``name.py`` (no directories), a valid Python module
+    name, and must not shadow the standard library, pytest, or the staged
+    test file.
+    """
+
+    if not isinstance(source_filename, str) or not _SOURCE_FILENAME.match(
+        source_filename
+    ):
+        return {
+            "success": False,
+            "error_type": "invalid_input",
+            "error": (
+                "source_filename must be a plain Python module file name such "
+                "as 'solution.py' (letters, digits and underscores only)."
+            )
+        }
+
+    module_name = source_filename[: -len(".py")]
+
+    if (
+        module_name in _RESERVED_MODULE_NAMES
+        or f"{module_name}.py" == USER_TEST_FILENAME
+    ):
+        return {
+            "success": False,
+            "error_type": "invalid_input",
+            "error": (
+                f"'{source_filename}' cannot be used inside the sandbox because "
+                "it shadows a standard-library or pytest module (or the staged "
+                "test file). Rename the file."
+            )
+        }
+
+    return {"success": True}
+
+
+def run_code_tests_in_sandbox(
+    source_code: str,
+    test_code: str,
+    source_filename: str = "solution.py",
+    timeout: int = EXECUTION_TIMEOUT
+) -> dict:
+    """
+    Run pytest ``test_code`` against ``source_code`` inside the Docker sandbox.
+
+    Both strings are written to a private staging directory on the host,
+    copied into the isolated container, and executed only there. The host
+    never imports or runs them. The staging directory is always removed.
+
+    The returned dict has the same shape as ``run_tests_in_sandbox``.
+    """
+
+    if (
+        not isinstance(source_code, str)
+        or not source_code.strip()
+        or not isinstance(test_code, str)
+        or not test_code.strip()
+    ):
+        return {
+            "success": False,
+            "error_type": "invalid_input",
+            "execution_success": False,
+            "report_parsed": False,
+            "tests_passed": None,
+            "error": "source_code and test_code must be non-empty strings."
+        }
+
+    filename_check = validate_source_filename(source_filename)
+
+    if not filename_check["success"]:
+        return {
+            **filename_check,
+            "execution_success": False,
+            "report_parsed": False,
+            "tests_passed": None
+        }
+
+    try:
+        STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(prefix="run-", dir=STAGING_ROOT))
+
+    except OSError as error:
+        return {
+            "success": False,
+            "error_type": "sandbox_error",
+            "execution_success": False,
+            "report_parsed": False,
+            "tests_passed": None,
+            "error": f"Could not create the sandbox staging directory: {error}"
+        }
+
+    try:
+        (staging_dir / source_filename).write_text(source_code, encoding="utf-8")
+        (staging_dir / USER_TEST_FILENAME).write_text(test_code, encoding="utf-8")
+
+        return run_tests_in_sandbox(
+            workspace_path=str(staging_dir),
+            relative_files=[source_filename, USER_TEST_FILENAME],
+            test_files=[USER_TEST_FILENAME],
+            timeout=timeout
+        )
+
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)

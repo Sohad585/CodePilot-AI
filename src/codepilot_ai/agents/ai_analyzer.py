@@ -1,16 +1,21 @@
 
 from codepilot_ai.llm_factory import get_llm
+from codepilot_ai.llm_utils import code_fence, error_result, extract_text
 
 
 def analyze_code_with_ai(source_code: str) -> dict:
     """
-    Analyze Python source code using Gemini.
+    Analyze Python source code using the configured LLM (Groq).
 
     This function does not execute the submitted code.
     It asks the LLM to identify potential issues and suggest improvements.
+
+    On failure the result contains ``error``, ``error_type`` and
+    ``retryable`` so callers can tell a provider problem from an analysis
+    problem.
     """
 
-    llm = get_llm()
+    fence_open, fence_close = code_fence(source_code)
 
     prompt = f"""
 You are an experienced Python code reviewer.
@@ -42,23 +47,14 @@ Return your analysis using these sections:
 
 Python code:
 
-```python
+{fence_open}
 {source_code}
-```
+{fence_close}
 """
 
     try:
-        response = llm.invoke(prompt)
-
-        content = response.content
-
-        # Handle text-block responses returned by some LangChain versions
-        if isinstance(content, list):
-            content = "\n".join(
-                block["text"]
-                for block in content
-                if isinstance(block, dict) and block.get("type") == "text"
-            )
+        llm = get_llm()
+        content = extract_text(llm.invoke(prompt))
 
         return {
             "success": True,
@@ -66,7 +62,4 @@ Python code:
         }
 
     except Exception as error:
-        return {
-            "success": False,
-            "error": str(error)
-        }
+        return error_result(error, context="The AI analysis")

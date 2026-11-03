@@ -1,4 +1,3 @@
-
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -17,6 +16,11 @@ wheels/
 
 # Local editor settings
 .vscode/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
 
 # Local archives and generated reports
 CodePilot-AI.zip
