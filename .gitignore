@@ -29,9 +29,11 @@ pytest_report.json
 # Generated files and local archives
 codepilot-frontend.zip
 uv
-gradio_demo/
+
 pytest_report.json
 
 # Accidental PowerShell output files
 = [
 ersAdminCodePilot-AI*
+
+gradio_demo/.gradio/
